@@ -503,4 +503,593 @@ Quick Actions:
 
 Stop process: Stop-Process -Id <PID> -Force
 Run full triage: powershell -File .\triage_lite.ps1 -LookbackHours 24
+=================================================================================================================
+In one go, save and run this below:
+
+<#
+.SYNOPSIS
+    Simplified native Windows / PowerShell Falcon RTR triage collector.
+
+.DESCRIPTION
+    Lightweight single-host live response collector designed for Falcon RTR or local elevated execution.
+    Uses native PowerShell and Windows utilities only.
+    Collects host, user, process, service, persistence, network, event summary, user artefact, and quick finding data.
+
+.NOTES
+    Recommended execution context: Falcon RTR running elevated/SYSTEM, or local PowerShell running as Administrator.
+    Output folder: C:\ProgramData\FalconRTR_Triage\<HOST>_<UTC_TIMESTAMP>
+    ZIP output:    C:\ProgramData\FalconRTR_Triage\<HOST>_<UTC_TIMESTAMP>.zip
+
+.EXAMPLE
+    powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\FalconRTR-Triage-Lite.ps1
+
+.EXAMPLE
+    powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\FalconRTR-Triage-Lite.ps1 -LookbackHours 24
+#>
+
+param(
+    [int]$LookbackHours = 72,
+    [string]$OutRoot = "$env:ProgramData\FalconRTR_Triage"
+)
+
+$ErrorActionPreference = "Continue"
+$ProgressPreference = "SilentlyContinue"
+
+$HostName = $env:COMPUTERNAME
+$UtcNow = (Get-Date).ToUniversalTime()
+$RunId = "$HostName" + "_" + $UtcNow.ToString("yyyyMMdd_HHmmss_UTC")
+
+$OutDir = Join-Path $OutRoot $RunId
+$ZipPath = Join-Path $OutRoot "$RunId.zip"
+$StartTime = (Get-Date).AddHours(-$LookbackHours)
+
+$HostDir        = Join-Path $OutDir "01_Host"
+$ProcessDir     = Join-Path $OutDir "02_Processes"
+$ServiceDir     = Join-Path $OutDir "03_Services"
+$PersistenceDir = Join-Path $OutDir "04_Persistence"
+$NetworkDir     = Join-Path $OutDir "05_Network"
+$EventDir       = Join-Path $OutDir "06_EventSummaries"
+$UserDir        = Join-Path $OutDir "07_Users"
+$FindingDir     = Join-Path $OutDir "08_Findings"
+
+@(
+    $OutRoot,
+    $OutDir,
+    $HostDir,
+    $ProcessDir,
+    $ServiceDir,
+    $PersistenceDir,
+    $NetworkDir,
+    $EventDir,
+    $UserDir,
+    $FindingDir
+) | ForEach-Object {
+    New-Item -Path $_ -ItemType Directory -Force | Out-Null
+}
+
+$LogPath = Join-Path $OutDir "collection_log.txt"
+
+"Falcon RTR lightweight triage started: $(Get-Date)" | Out-File -FilePath $LogPath -Encoding UTF8
+"Host: $HostName" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+"Lookback hours: $LookbackHours" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+"Output folder: $OutDir" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+
+# ==================================================================================================
+# 1. Host information
+# ==================================================================================================
+
+try {
+    Get-ComputerInfo | Out-File -FilePath (Join-Path $HostDir "computer_info.txt") -Encoding UTF8
+}
+catch {
+    "Get-ComputerInfo failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+systeminfo.exe | Out-File -FilePath (Join-Path $HostDir "systeminfo.txt") -Encoding UTF8
+whoami.exe /all | Out-File -FilePath (Join-Path $HostDir "whoami_all.txt") -Encoding UTF8
+hostname.exe | Out-File -FilePath (Join-Path $HostDir "hostname.txt") -Encoding UTF8
+cmd.exe /c set | Out-File -FilePath (Join-Path $HostDir "environment_variables.txt") -Encoding UTF8
+
+try {
+    Get-CimInstance Win32_OperatingSystem |
+        Select-Object Caption, Version, BuildNumber, OSArchitecture, InstallDate, LastBootUpTime, LocalDateTime, CSName |
+        Export-Csv -Path (Join-Path $HostDir "os.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "OS collection failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+try {
+    Get-CimInstance Win32_ComputerSystem |
+        Select-Object Manufacturer, Model, Domain, PartOfDomain, UserName, TotalPhysicalMemory |
+        Export-Csv -Path (Join-Path $HostDir "computer_system.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "Computer system collection failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+try {
+    Get-CimInstance Win32_LogicalDisk |
+        Select-Object DeviceID, DriveType, VolumeName, FileSystem, Size, FreeSpace |
+        Export-Csv -Path (Join-Path $HostDir "logical_disks.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "Logical disk collection failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+# ==================================================================================================
+# 2. Users and local admins
+# ==================================================================================================
+
+try {
+    Get-LocalUser |
+        Select-Object Name, Enabled, LastLogon, PasswordLastSet, PasswordRequired, SID, Description |
+        Export-Csv -Path (Join-Path $UserDir "local_users.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    net.exe user | Out-File -FilePath (Join-Path $UserDir "net_users.txt") -Encoding UTF8
+}
+
+try {
+    Get-LocalGroup |
+        Select-Object Name, SID, Description |
+        Export-Csv -Path (Join-Path $UserDir "local_groups.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    net.exe localgroup | Out-File -FilePath (Join-Path $UserDir "net_localgroup.txt") -Encoding UTF8
+}
+
+try {
+    Get-LocalGroupMember -Group "Administrators" |
+        Select-Object Name, ObjectClass, PrincipalSource, SID |
+        Export-Csv -Path (Join-Path $UserDir "local_administrators.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    net.exe localgroup administrators | Out-File -FilePath (Join-Path $UserDir "local_administrators.txt") -Encoding UTF8
+}
+
+try {
+    Get-CimInstance Win32_UserProfile |
+        Select-Object LocalPath, SID, Loaded, Special, LastUseTime |
+        Export-Csv -Path (Join-Path $UserDir "user_profiles.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "User profile collection failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+# ==================================================================================================
+# 3. Processes
+# ==================================================================================================
+
+try {
+    Get-CimInstance Win32_Process |
+        Select-Object Name, ProcessId, ParentProcessId, ExecutablePath, CommandLine, CreationDate, SessionId |
+        Export-Csv -Path (Join-Path $ProcessDir "processes.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "Process collection failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+tasklist.exe /v | Out-File -FilePath (Join-Path $ProcessDir "tasklist_verbose.txt") -Encoding UTF8
+
+# ==================================================================================================
+# 4. Services and drivers
+# ==================================================================================================
+
+try {
+    Get-CimInstance Win32_Service |
+        Select-Object Name, DisplayName, State, StartMode, StartName, PathName, ProcessId, ServiceType, Description |
+        Export-Csv -Path (Join-Path $ServiceDir "services.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "Service collection failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+try {
+    Get-CimInstance Win32_SystemDriver |
+        Select-Object Name, DisplayName, State, StartMode, PathName, ServiceType |
+        Export-Csv -Path (Join-Path $ServiceDir "system_drivers.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "Driver collection failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+sc.exe query state= all | Out-File -FilePath (Join-Path $ServiceDir "sc_query_all.txt") -Encoding UTF8
+
+# ==================================================================================================
+# 5. Scheduled tasks
+# ==================================================================================================
+
+try {
+    $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue
+
+    $taskSummary = foreach ($task in $tasks) {
+        $info = $null
+
+        try {
+            $info = Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction SilentlyContinue
+        }
+        catch {}
+
+        [PSCustomObject]@{
+            TaskName       = $task.TaskName
+            TaskPath       = $task.TaskPath
+            State          = $task.State
+            Author         = $task.Author
+            Description    = $task.Description
+            LastRunTime    = if ($info) { $info.LastRunTime } else { $null }
+            NextRunTime    = if ($info) { $info.NextRunTime } else { $null }
+            LastTaskResult = if ($info) { $info.LastTaskResult } else { $null }
+            Actions        = ($task.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join " || "
+            Triggers       = ($task.Triggers | ForEach-Object { $_.ToString() }) -join " || "
+        }
+    }
+
+    $taskSummary | Export-Csv -Path (Join-Path $PersistenceDir "scheduled_tasks.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "Scheduled task collection failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+schtasks.exe /query /fo LIST /v | Out-File -FilePath (Join-Path $PersistenceDir "schtasks_verbose.txt") -Encoding UTF8
+
+# ==================================================================================================
+# 6. Registry Run keys
+# ==================================================================================================
+
+try {
+    $startupItems = @()
+
+    $runKeys = @(
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+    )
+
+    foreach ($key in $runKeys) {
+        if (Test-Path $key) {
+            $props = Get-ItemProperty -Path $key
+
+            foreach ($prop in $props.PSObject.Properties) {
+                if ($prop.Name -notmatch "^PS") {
+                    $startupItems += [PSCustomObject]@{
+                        Source = $key
+                        Name   = $prop.Name
+                        Value  = [string]$prop.Value
+                    }
+                }
+            }
+        }
+    }
+
+    $startupItems | Export-Csv -Path (Join-Path $PersistenceDir "run_keys.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "Run key collection failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+# ==================================================================================================
+# 7. Startup folders
+# ==================================================================================================
+
+try {
+    $startupFolders = @(
+        "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+    )
+
+    Get-CimInstance Win32_UserProfile |
+        Where-Object { $_.LocalPath -and (Test-Path $_.LocalPath) -and -not $_.Special } |
+        ForEach-Object {
+            $startupFolders += Join-Path $_.LocalPath "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+        }
+
+    $startupFolderItems = foreach ($folder in $startupFolders) {
+        if (Test-Path -LiteralPath $folder) {
+            Get-ChildItem -LiteralPath $folder -Force -ErrorAction SilentlyContinue |
+                Select-Object FullName, Name, Length, CreationTimeUtc, LastWriteTimeUtc
+        }
+    }
+
+    $startupFolderItems | Export-Csv -Path (Join-Path $PersistenceDir "startup_folder_items.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "Startup folder collection failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+# ==================================================================================================
+# 8. WMI persistence
+# ==================================================================================================
+
+try {
+    Get-CimInstance -Namespace root\subscription -ClassName __EventFilter |
+        Select-Object Name, Query, QueryLanguage, EventNamespace |
+        Export-Csv -Path (Join-Path $PersistenceDir "wmi_event_filters.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {}
+
+try {
+    Get-CimInstance -Namespace root\subscription -ClassName CommandLineEventConsumer |
+        Select-Object Name, CommandLineTemplate, ExecutablePath, WorkingDirectory |
+        Export-Csv -Path (Join-Path $PersistenceDir "wmi_commandline_consumers.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {}
+
+try {
+    Get-CimInstance -Namespace root\subscription -ClassName __FilterToConsumerBinding |
+        Select-Object Filter, Consumer |
+        Export-Csv -Path (Join-Path $PersistenceDir "wmi_filter_bindings.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {}
+
+# ==================================================================================================
+# 9. Network artefacts
+# ==================================================================================================
+
+try {
+    Get-NetTCPConnection |
+        Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, State, OwningProcess, CreationTime |
+        Export-Csv -Path (Join-Path $NetworkDir "tcp_connections.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    netstat.exe -ano | Out-File -FilePath (Join-Path $NetworkDir "netstat_ano.txt") -Encoding UTF8
+}
+
+try {
+    Get-NetUDPEndpoint |
+        Select-Object LocalAddress, LocalPort, OwningProcess, CreationTime |
+        Export-Csv -Path (Join-Path $NetworkDir "udp_endpoints.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {}
+
+try {
+    Get-DnsClientCache |
+        Select-Object Entry, Name, Type, Data, Status, TimeToLive, Section |
+        Export-Csv -Path (Join-Path $NetworkDir "dns_cache.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    ipconfig.exe /displaydns | Out-File -FilePath (Join-Path $NetworkDir "ipconfig_displaydns.txt") -Encoding UTF8
+}
+
+ipconfig.exe /all | Out-File -FilePath (Join-Path $NetworkDir "ipconfig_all.txt") -Encoding UTF8
+route.exe print | Out-File -FilePath (Join-Path $NetworkDir "route_print.txt") -Encoding UTF8
+arp.exe -a | Out-File -FilePath (Join-Path $NetworkDir "arp_a.txt") -Encoding UTF8
+netsh.exe winhttp show proxy | Out-File -FilePath (Join-Path $NetworkDir "winhttp_proxy.txt") -Encoding UTF8
+
+try {
+    Get-NetFirewallProfile |
+        Export-Csv -Path (Join-Path $NetworkDir "firewall_profiles.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {}
+
+# ==================================================================================================
+# 10. Event summaries only
+# ==================================================================================================
+
+try {
+    Get-WinEvent -FilterHashtable @{
+        LogName   = "Security"
+        Id        = @(4624,4625,4648,4672,4688,4697,4698,4702,4720,4722,4728,4732,4740,1102)
+        StartTime = $StartTime
+    } -ErrorAction Stop |
+        Select-Object TimeCreated, Id, ProviderName, MachineName, LevelDisplayName, Message |
+        Export-Csv -Path (Join-Path $EventDir "security_key_events.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "Security event summary failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+try {
+    Get-WinEvent -FilterHashtable @{
+        LogName   = "System"
+        Id        = @(7040,7045,7036,6005,6006,6008,1074)
+        StartTime = $StartTime
+    } -ErrorAction Stop |
+        Select-Object TimeCreated, Id, ProviderName, MachineName, LevelDisplayName, Message |
+        Export-Csv -Path (Join-Path $EventDir "system_key_events.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "System event summary failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+try {
+    Get-WinEvent -FilterHashtable @{
+        LogName   = "Microsoft-Windows-PowerShell/Operational"
+        Id        = @(4103,4104,4105,4106)
+        StartTime = $StartTime
+    } -ErrorAction Stop |
+        Select-Object TimeCreated, Id, ProviderName, MachineName, LevelDisplayName, Message |
+        Export-Csv -Path (Join-Path $EventDir "powershell_operational_key_events.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "PowerShell Operational event summary failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+try {
+    Get-WinEvent -FilterHashtable @{
+        LogName   = "Windows PowerShell"
+        Id        = @(400,403,600,800)
+        StartTime = $StartTime
+    } -ErrorAction Stop |
+        Select-Object TimeCreated, Id, ProviderName, MachineName, LevelDisplayName, Message |
+        Export-Csv -Path (Join-Path $EventDir "windows_powershell_key_events.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "Windows PowerShell event summary failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+# ==================================================================================================
+# 11. User artefacts
+# ==================================================================================================
+
+try {
+    $profiles = Get-CimInstance Win32_UserProfile |
+        Where-Object { $_.LocalPath -and (Test-Path $_.LocalPath) -and -not $_.Special }
+
+    $psHistoryFiles = foreach ($profile in $profiles) {
+        $hist = Join-Path $profile.LocalPath "AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+
+        if (Test-Path -LiteralPath $hist) {
+            $destName = (($profile.SID) -replace '[\\/:*?"<>|]', '_') + "_ConsoleHost_history.txt"
+            Copy-Item -LiteralPath $hist -Destination (Join-Path $UserDir $destName) -Force -ErrorAction SilentlyContinue
+
+            Get-Item -LiteralPath $hist |
+                Select-Object FullName, Length, CreationTimeUtc, LastWriteTimeUtc
+        }
+    }
+
+    $psHistoryFiles | Export-Csv -Path (Join-Path $UserDir "powershell_history_files.csv") -NoTypeInformation -Encoding UTF8
+
+    $recentItems = foreach ($profile in $profiles) {
+        $recentPath = Join-Path $profile.LocalPath "AppData\Roaming\Microsoft\Windows\Recent"
+
+        if (Test-Path -LiteralPath $recentPath) {
+            Get-ChildItem -LiteralPath $recentPath -Force -ErrorAction SilentlyContinue |
+                Select-Object @{Name="ProfilePath";Expression={$profile.LocalPath}}, FullName, Name, CreationTimeUtc, LastWriteTimeUtc, Length
+        }
+    }
+
+    $recentItems | Export-Csv -Path (Join-Path $UserDir "recent_items_metadata.csv") -NoTypeInformation -Encoding UTF8
+}
+catch {
+    "User artefact collection failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+}
+
+# ==================================================================================================
+# 12. Quick suspicious findings
+# ==================================================================================================
+
+$findings = @()
+
+# 12.1 Suspicious process command lines
+$procCsv = Join-Path $ProcessDir "processes.csv"
+
+if (Test-Path $procCsv) {
+    Import-Csv $procCsv |
+        Where-Object {
+            $_.CommandLine -match '(?i)encodedcommand|-enc|downloadstring|invoke-expression|iex|bypass|hidden|frombase64string|rundll32|regsvr32|mshta|wscript|cscript'
+        } |
+        ForEach-Object {
+            $findings += [PSCustomObject]@{
+                Category = "Suspicious process command line"
+                Item     = $_.Name
+                Detail   = $_.CommandLine
+            }
+        }
+}
+
+# 12.2 Suspicious service paths
+$svcCsv = Join-Path $ServiceDir "services.csv"
+
+if (Test-Path $svcCsv) {
+    Import-Csv $svcCsv |
+        Where-Object {
+            $_.PathName -match '(?i)\\users\\|\\appdata\\|\\temp\\|\\programdata\\'
+        } |
+        ForEach-Object {
+            $findings += [PSCustomObject]@{
+                Category = "Service path in suspicious location"
+                Item     = $_.Name
+                Detail   = $_.PathName
+            }
+        }
+}
+
+# 12.3 Suspicious scheduled task actions
+$taskCsv = Join-Path $PersistenceDir "scheduled_tasks.csv"
+
+if (Test-Path $taskCsv) {
+    Import-Csv $taskCsv |
+        Where-Object {
+            $_.Actions -match '(?i)powershell|cmd.exe|wscript|cscript|mshta|rundll32|regsvr32|encodedcommand|-enc|bypass|appdata|temp|programdata'
+        } |
+        ForEach-Object {
+            $findings += [PSCustomObject]@{
+                Category = "Suspicious scheduled task action"
+                Item     = "$($_.TaskPath)$($_.TaskName)"
+                Detail   = $_.Actions
+            }
+        }
+}
+
+# 12.4 Suspicious Run key values
+$runCsv = Join-Path $PersistenceDir "run_keys.csv"
+
+if (Test-Path $runCsv) {
+    Import-Csv $runCsv |
+        Where-Object {
+            $_.Value -match '(?i)powershell|cmd.exe|wscript|cscript|mshta|rundll32|regsvr32|appdata|temp|programdata'
+        } |
+        ForEach-Object {
+            $findings += [PSCustomObject]@{
+                Category = "Suspicious autorun registry value"
+                Item     = $_.Name
+                Detail   = "$($_.Source) :: $($_.Value)"
+            }
+        }
+}
+
+# 12.5 DNS cache analysis
+$dnsCsv = Join-Path $NetworkDir "dns_cache.csv"
+
+if (Test-Path $dnsCsv) {
+    Import-Csv $dnsCsv |
+        Where-Object {
+            $_.Name -match '(?i)[a-z0-9]{10,}\.(com|net|xyz|top|ru|cn)' -or
+            $_.Name -match '(?i)pastebin|ngrok|duckdns|no-ip|tor2web|bit\.ly|tinyurl'
+        } |
+        ForEach-Object {
+            $findings += [PSCustomObject]@{
+                Category = "Suspicious DNS query"
+                Item     = $_.Name
+                Detail   = "Resolved to: $($_.Data)"
+            }
+        }
+}
+
+$findings | Export-Csv -Path (Join-Path $FindingDir "quick_findings.csv") -NoTypeInformation -Encoding UTF8
+
+# ==================================================================================================
+# 13. Create ZIP
+# ==================================================================================================
+
+if (Test-Path -LiteralPath $ZipPath) {
+    Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
+}
+
+try {
+    Compress-Archive -LiteralPath $OutDir -DestinationPath $ZipPath -Force -ErrorAction Stop
+}
+catch {
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($OutDir, $ZipPath)
+    }
+    catch {
+        "ZIP creation failed: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+    }
+}
+
+"Falcon RTR lightweight triage completed: $(Get-Date)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+"ZIP: $ZipPath" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+
+Write-Host ""
+Write-Host "============================================================"
+Write-Host "Falcon RTR lightweight triage complete"
+Write-Host "Output folder: $OutDir"
+Write-Host "ZIP: $ZipPath"
+Write-Host "============================================================"
+Write-Host ""
+
+<#
+Quick actions, if required during a live investigation:
+
+Stop a known malicious process:
+    Stop-Process -Id <PID> -Force
+
+Run with a shorter investigation window:
+    powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\FalconRTR-Triage-Lite.ps1 -LookbackHours 24
+#>
 
